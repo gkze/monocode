@@ -6,9 +6,10 @@
 //!
 //! Tao's `trafficLightPosition` re-runs `setFrame` on the titlebar *every
 //! drawRect* using `window.frame().height`. That is why the buttons jumped
-//! during live resize. We never set that option. Buttons are Auto Layout
-//! pinned once. The container is `setFrame`'d to 40px on install,
-//! resize, and focus — not from `drawRect`.
+//! during live resize. We never set that option. Each window's buttons are
+//! Auto Layout pinned once, and again only if AppKit rebuilds them. The
+//! container is `setFrame`'d to 40px on install, resize, and focus — not from
+//! `drawRect`.
 //!
 //! Window glass uses an AppKit visual-effect backdrop below WKWebView. Its
 //! Gaussian blur samples the desktop; a separate native view supplies the
@@ -25,7 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void, OsStr};
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
@@ -67,7 +68,6 @@ const FLOATING_CORNER_RADIUS: f64 = 16.0;
 
 const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
-static PINNED: AtomicBool = AtomicBool::new(false);
 static BLUR_RADIUS: AtomicU8 = AtomicU8::new(BLUR_DEFAULT);
 static WINDOW_BADGES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 static GLASS_WINDOWS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -92,11 +92,19 @@ pub fn register_spellcheck_default() {
     unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
 }
 
+/// Sets up a workspace window's chrome. AppKit is main-thread only, and later
+/// windows can be built off it (the async `open_new_window` command), so the
+/// work hops to the main thread when needed.
 pub fn install(window: &WebviewWindow) {
+    if MainThreadMarker::new().is_none() {
+        let target = window.clone();
+        let _ = window.run_on_main_thread(move || install(&target));
+        return;
+    }
     // Opaque for the dock bounce so the first frames are a solid field,
     // not a frosted desktop. Glass turns on after the first UI paint.
     prepare_launch(window);
-    let _ = pin(window);
+    pin(window);
 
     let event_window = window.clone();
     window.on_window_event(move |event| match event {
@@ -608,17 +616,14 @@ fn apply_blur(window: &WebviewWindow, radius: u8) {
     }
 }
 
-fn pin(window: &WebviewWindow) -> bool {
+fn pin(window: &WebviewWindow) {
     let Some(ns_window) = ns_window(window) else {
-        return PINNED.load(Ordering::Relaxed);
+        return;
     };
     unsafe {
-        if !PINNED.load(Ordering::Relaxed) && !pin_ns_window(&ns_window) {
-            return false;
-        }
+        pin_ns_window(&ns_window);
         stretch_ns_window(&ns_window);
     }
-    true
 }
 
 fn stretch_titlebar(window: &WebviewWindow) {
@@ -652,13 +657,18 @@ fn button_kinds() -> [objc2_app_kit::NSWindowButton; 3] {
     ]
 }
 
-unsafe fn pin_ns_window(window: &NSWindow) -> bool {
+/// Pins this window's buttons that aren't pinned yet. Each button records its
+/// own state, as in the GPUI app's `traffic_lights::pin`: AppKit builds the
+/// buttons with autoresizing-mask constraints, so one without them was pinned
+/// here. That covers every window (⌘N, Dock reopen) and buttons AppKit
+/// rebuilds, with no shared flag to keep or clear when a window closes.
+unsafe fn pin_ns_window(window: &NSWindow) {
     let kinds = button_kinds();
     let Some(close) = window.standardWindowButton(kinds[0]) else {
-        return false;
+        return;
     };
     let Some(titlebar) = close.superview() else {
-        return false;
+        return;
     };
 
     titlebar.setClipsToBounds(false);
@@ -670,6 +680,10 @@ unsafe fn pin_ns_window(window: &NSWindow) -> bool {
         let Some(button) = window.standardWindowButton(*kind) else {
             continue;
         };
+        // Already pinned: a second set of constraints would only conflict.
+        if !button.translatesAutoresizingMaskIntoConstraints() {
+            continue;
+        }
         button.setTranslatesAutoresizingMaskIntoConstraints(false);
         let x = LEFT_MARGIN + i as f64 * (BUTTON_SIZE + BUTTON_SPACING);
         let w = button.widthAnchor().constraintEqualToConstant(BUTTON_SIZE);
@@ -685,9 +699,6 @@ unsafe fn pin_ns_window(window: &NSWindow) -> bool {
         leading.setActive(true);
         top.setActive(true);
     }
-
-    PINNED.store(true, Ordering::Relaxed);
-    true
 }
 
 unsafe fn stretch_ns_window(window: &NSWindow) {
